@@ -1,0 +1,615 @@
+"""Unified Gradio app for the CS5788 image-editor project.
+
+Three tabs, one image -> three different operations:
+  1. Replace Object  (Stefan)   -- swap one object in a real photo for another
+  2. Move Object     (teammate) -- DDPM noise-shift relocation, paint two masks
+  3. Apply Style     (teammate) -- LoRA-blended art-style transfer
+
+Each module loads its own SD components LAZILY on first use of that tab.
+Models live across tab switches; only freshly-clicked tabs trigger loads.
+
+Run locally:
+    python platform/app.py
+
+Public sharable link: starts on launch (share=True).
+"""
+import sys
+from pathlib import Path
+
+import gradio as gr
+import numpy as np
+from PIL import Image
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "replace"))
+sys.path.insert(0, str(PROJECT_ROOT / "relocate"))
+sys.path.insert(0, str(PROJECT_ROOT / "style"))
+
+
+# ============================================================================
+# LAZY MODEL LOADERS  (each module loads its own SD on first call)
+# ============================================================================
+_object_editor = None
+_relocation_pipe = None
+_style_pipe = None
+
+
+def _get_object_editor():
+    global _object_editor
+    if _object_editor is None:
+        gr.Info("Loading Stable Diffusion 1.5 for object replacement (one-time, ~30s)...")
+        from sd_components import load_sd
+        from editor import Editor
+        _object_editor = Editor(load_sd())
+    return _object_editor
+
+
+def _get_relocation_pipe():
+    global _relocation_pipe
+    if _relocation_pipe is None:
+        gr.Info("Loading Stable Diffusion 2.1 for object relocation (one-time, ~60s)...")
+        from pipeline.relocation_pipeline import ObjectRelocationPipeline
+        _relocation_pipe = ObjectRelocationPipeline()
+    return _relocation_pipe
+
+
+def _get_style_pipe():
+    global _style_pipe
+    if _style_pipe is None:
+        gr.Info("Loading Stable Diffusion 1.5 img2img + LoRA adapters (one-time, ~30s)...")
+        # The style module has a stale runwayml/* model ID baked in. Monkey-patch
+        # the module-global before loading so we don't have to edit the source.
+        import inference
+        inference.MODEL_ID = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+        # styles.py uses relative LoRA paths ("output/lora/van_gogh/final"), which
+        # don't resolve from the project root. Rewrite each entry's lora_dir to
+        # an absolute path under style/output/lora/.
+        import styles
+        style_root = PROJECT_ROOT / "style"
+        for key, cfg in styles.STYLES.items():
+            cfg["lora_dir"] = str(style_root / cfg["lora_dir"])
+        _style_pipe = inference.load_pipeline(inference.get_device())
+    return _style_pipe
+
+
+# ============================================================================
+# TAB 1 — Object Replacement
+# ============================================================================
+SCHEDULES = {
+    "Linear decay (recommended)": "linear_decay",
+    "Vanilla P2P (baseline)": "vanilla_p2p",
+    "Cosine": "cosine",
+    "Constant 0.5 (slow blend)": "constant_05",
+    "Piecewise": "piecewise",
+}
+
+
+def _build_schedule(name_key: str):
+    from schedules import (
+        constant_replaced, cosine_replaced, linear_decay_replaced,
+        piecewise_demo, vanilla_p2p,
+    )
+    return {
+        "linear_decay": linear_decay_replaced(),
+        "vanilla_p2p":  vanilla_p2p(0.8),
+        "cosine":       cosine_replaced(),
+        "constant_05":  constant_replaced(0.5),
+        "piecewise":    piecewise_demo(),
+    }[name_key]
+
+
+def run_replace(image, source_prompt, target_prompt, schedule_name,
+                mask_mode, composite_mode, background_prompt):
+    if image is None:
+        return None, "Upload an image first."
+    if not source_prompt or not target_prompt:
+        return None, "Fill in both source and target prompts."
+
+    editor = _get_object_editor()
+    schedule = _build_schedule(SCHEDULES[schedule_name])
+    # Preserve the original frame: edit inside a 512x512 center-crop, then
+    # paste the result back into the original at full resolution. Side strips
+    # outside the crop region remain literally the source pixels.
+    original = (image if isinstance(image, Image.Image) else Image.fromarray(image)).convert("RGB")
+    w_orig, h_orig = original.size
+    side = min(w_orig, h_orig)
+    left = (w_orig - side) // 2
+    top = (h_orig - side) // 2
+    img_square = original.crop((left, top, left + side, top + side)).resize((512, 512), Image.LANCZOS)
+
+    try:
+        result_512 = editor.edit(
+            img_square, source_prompt, target_prompt,
+            schedule=schedule,
+            mask_mode=mask_mode,
+            composite_mode=composite_mode,
+            background_prompt=background_prompt or None,
+        )
+        result_at_crop_size = result_512.resize((side, side), Image.LANCZOS)
+        final = original.copy()
+        final.paste(result_at_crop_size, (left, top))
+        return final, "Done."
+    except Exception as e:
+        return None, f"Error: {e}"
+
+
+# ============================================================================
+# TAB 2 — Object Relocation
+# ============================================================================
+def _extract_mask(editor_value, fallback_size=(512, 512)):
+    if editor_value is None:
+        return Image.new("L", fallback_size, 0)
+    layers = editor_value.get("layers") or []
+    if not layers or layers[0] is None:
+        return Image.new("L", fallback_size, 0)
+    layer = layers[0]
+    if layer.mode == "RGBA":
+        return layer.split()[3]
+    return layer.convert("L")
+
+
+def _seed_editors(image):
+    """When an image is uploaded, push it into both mask editors so the user can paint on it."""
+    if image is None:
+        return gr.update(), gr.update()
+    blank = {"background": image, "layers": [], "composite": image}
+    return blank, blank
+
+
+def run_relocate(image, src_editor, tgt_editor, prompt, use_noise_shift,
+                 seed, num_steps, sdedit_strength, guidance_scale):
+    if image is None:
+        return None, "Upload an image first."
+    if not prompt or not prompt.strip():
+        return None, "Describe the final scene in the prompt."
+
+    src_mask = _extract_mask(src_editor, image.size)
+    tgt_mask = _extract_mask(tgt_editor, image.size)
+    if np.array(src_mask).sum() == 0:
+        return None, "Paint a source mask (where the object IS now)."
+    if np.array(tgt_mask).sum() == 0:
+        return None, "Paint a target mask (where the object SHOULD GO)."
+
+    pipe = _get_relocation_pipe()
+    try:
+        result, _composite = pipe(
+            image, prompt, src_mask, tgt_mask,
+            use_noise_shift=bool(use_noise_shift),
+            seed=int(seed),
+            num_inference_steps=int(num_steps),
+            sdedit_strength=float(sdedit_strength),
+            guidance_scale=float(guidance_scale),
+        )
+        return result, "Done."
+    except Exception as e:
+        return None, f"Error: {e}"
+
+
+# ============================================================================
+# TAB 3 — Style Transfer
+# ============================================================================
+NONE_LABEL = "(none)"
+
+
+def _style_choices():
+    """Read the live STYLES dict from style.styles."""
+    try:
+        from styles import STYLES
+        return [NONE_LABEL] + [STYLES[k]["display_name"] for k in STYLES]
+    except Exception:
+        return [NONE_LABEL]
+
+
+def _display_to_key(display: str) -> str | None:
+    if display == NONE_LABEL:
+        return None
+    from styles import STYLES
+    for k, v in STYLES.items():
+        if v["display_name"] == display:
+            return k
+    return None
+
+
+def run_style(image, style1, w1, style2, w2, style3, w3,
+              strength, num_steps, guidance_scale, seed):
+    if image is None:
+        return None, "Upload an image first."
+
+    keys = [(_display_to_key(style1), w1),
+            (_display_to_key(style2), w2),
+            (_display_to_key(style3), w3)]
+    keys = [(k, w) for k, w in keys if k is not None and w > 0]
+    if not keys:
+        return None, "Pick at least one style."
+
+    pipe = _get_style_pipe()
+    from inference import set_style_mix, build_prompt, stylize_image
+    try:
+        set_style_mix(pipe, keys)
+        prompt = build_prompt(keys)
+        result = stylize_image(
+            pipe, image, prompt,
+            strength=float(strength),
+            guidance_scale=float(guidance_scale),
+            num_inference_steps=int(num_steps),
+            seed=int(seed) if seed is not None else None,
+        )
+        return result, f"Applied: {prompt}"
+    except Exception as e:
+        return None, f"Error: {e}"
+
+
+# ============================================================================
+# UI
+# ============================================================================
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@1,72,200;1,72,300;1,72,400&display=swap');
+
+/* ============================================================
+   Editorial brutalism — strict B&W, hard edges, mono labels
+   ============================================================ */
+
+* { border-radius: 0 !important; }
+
+:root, body, .gradio-container, .dark {
+    background: #000 !important;
+    color: #fafafa !important;
+    font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    font-feature-settings: "ss01", "cv11" !important;
+}
+.gradio-container { max-width: 1680px !important; margin: 0 auto !important; padding: 32px 48px !important; }
+footer, .gradio-container > footer { display: none !important; }
+
+/* --- top bar (slim, not a hero) ----------------------------------------- */
+#topbar {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding: 16px 4px 20px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid #1a1a1a;
+}
+#topbar .wordmark {
+    font-family: 'Newsreader', serif !important;
+    font-style: italic; font-weight: 300;
+    font-size: 22px; letter-spacing: -0.01em;
+    color: #fafafa;
+}
+#topbar .meta {
+    font-family: 'Geist Mono', monospace;
+    font-size: 10px; letter-spacing: 0.22em;
+    color: #555; text-transform: uppercase;
+}
+
+/* --- tabs (mono pills) --------------------------------------------------- */
+.tab-nav { background: transparent !important; border: none !important; gap: 0 !important; border-bottom: 1px solid #1a1a1a !important; padding-bottom: 0 !important; }
+.tab-nav button {
+    background: transparent !important; color: #555 !important;
+    border: none !important; border-bottom: 1px solid transparent !important;
+    padding: 18px 24px !important;
+    font-family: 'Geist Mono', monospace !important;
+    font-size: 11px !important; font-weight: 500 !important;
+    letter-spacing: 0.18em !important; text-transform: uppercase !important;
+    transition: all 0.15s ease !important;
+}
+.tab-nav button:hover { color: #aaa !important; }
+.tab-nav button.selected {
+    color: #fafafa !important;
+    border-bottom: 1px solid #fafafa !important;
+}
+
+/* --- cards / blocks (slim outlines, no fills) ---------------------------- */
+.gr-block, .block, .form, .gr-form {
+    background: #000 !important;
+    border: 1px solid #1a1a1a !important;
+}
+.tabitem { padding-top: 32px !important; }
+
+/* --- inputs (text + dropdown only; radios/checkboxes/sliders excluded) -- */
+input:not([type="radio"]):not([type="checkbox"]):not([type="range"]),
+textarea, select, .gr-textbox textarea, .gr-dropdown {
+    background: #000 !important; color: #fafafa !important;
+    border: 1px solid #2a2a2a !important;
+    font-family: 'Geist', sans-serif !important;
+    font-size: 14px !important; padding: 12px 14px !important;
+}
+input:not([type="radio"]):not([type="checkbox"]):not([type="range"]):focus,
+textarea:focus, .gr-textbox textarea:focus {
+    border-color: #fafafa !important;
+    outline: none !important; box-shadow: none !important;
+}
+/* radio + checkbox: leave native sizing/hit-test alone, just recolor */
+input[type="radio"], input[type="checkbox"] {
+    accent-color: #fafafa !important;
+    cursor: pointer !important;
+}
+
+/* --- labels (mono small-caps) -------------------------------------------- */
+label, .label-wrap span, .gr-form label, .block-label {
+    font-family: 'Geist Mono', monospace !important;
+    font-size: 10px !important; font-weight: 500 !important;
+    color: #666 !important;
+    text-transform: uppercase !important; letter-spacing: 0.18em !important;
+}
+
+/* --- buttons (high-contrast invert) -------------------------------------- */
+button.primary, .gr-button-primary, button[variant="primary"] {
+    background: #fafafa !important; color: #000 !important;
+    border: 1px solid #fafafa !important;
+    font-family: 'Geist Mono', monospace !important;
+    font-size: 12px !important; font-weight: 500 !important;
+    letter-spacing: 0.16em !important; text-transform: uppercase !important;
+    padding: 16px 28px !important;
+    box-shadow: none !important;
+    transition: all 0.15s ease !important;
+}
+button.primary:hover, .gr-button-primary:hover, button[variant="primary"]:hover {
+    background: #000 !important; color: #fafafa !important;
+    border: 1px solid #fafafa !important;
+}
+button.secondary, .gr-button-secondary {
+    background: #000 !important; color: #fafafa !important;
+    border: 1px solid #2a2a2a !important;
+    font-family: 'Geist Mono', monospace !important;
+}
+
+/* --- sliders / radios ---------------------------------------------------- */
+.gr-radio label, .gr-checkbox label {
+    color: #aaa !important; font-family: 'Geist', sans-serif !important;
+    font-size: 13px !important; text-transform: none !important; letter-spacing: 0 !important;
+}
+input[type="range"]::-webkit-slider-thumb { background: #fafafa !important; }
+input[type="range"]::-webkit-slider-runnable-track { background: #2a2a2a !important; }
+
+/* --- accordions ---------------------------------------------------------- */
+.gr-accordion {
+    background: #000 !important;
+    border: 1px solid #1a1a1a !important;
+}
+.gr-accordion summary, .gr-accordion .label-wrap {
+    color: #888 !important;
+    font-family: 'Geist Mono', monospace !important;
+    font-size: 11px !important; text-transform: uppercase; letter-spacing: 0.18em;
+}
+
+/* --- images -------------------------------------------------------------- */
+.gr-image, .image-container, .gr-image-container {
+    background: #000 !important; border: 1px solid #1a1a1a !important;
+}
+
+/* --- markdown ------------------------------------------------------------ */
+.gr-markdown, .prose {
+    color: #aaa !important; background: transparent !important;
+    font-family: 'Geist', sans-serif !important;
+}
+.gr-markdown p { color: #888 !important; font-size: 14px !important; line-height: 1.65 !important; }
+.gr-markdown strong { color: #fafafa !important; font-weight: 600 !important; }
+.gr-markdown em { font-family: 'Newsreader', serif !important; font-style: italic; color: #fafafa !important; }
+
+/* --- footer -------------------------------------------------------------- */
+.app-footer {
+    text-align: center; padding: 56px 16px 16px;
+    color: #444; font-size: 10px;
+    font-family: 'Geist Mono', monospace;
+    letter-spacing: 0.22em; text-transform: uppercase;
+}
+
+/* kill stray gradients & rounded artifacts from third-party widgets */
+* { box-shadow: none !important; }
+.gr-image, button, input, .gr-block, .block { border-radius: 0 !important; }
+"""
+
+THEME = gr.themes.Base(
+    primary_hue="gray",
+    secondary_hue="gray",
+    neutral_hue="zinc",
+    font=("Inter Tight", "ui-sans-serif", "system-ui"),
+).set(
+    body_background_fill="#000000",
+    body_text_color="#fafafa",
+    background_fill_primary="#000000",
+    background_fill_secondary="#000000",
+    border_color_primary="#1a1a1a",
+    block_radius="0",
+    input_radius="0",
+    button_large_radius="0",
+    button_small_radius="0",
+    button_primary_background_fill="#fafafa",
+    button_primary_background_fill_hover="#000000",
+    button_primary_text_color="#000000",
+    button_primary_text_color_hover="#fafafa",
+    button_primary_border_color="#fafafa",
+    block_title_text_color="#666666",
+    block_label_text_color="#666666",
+)
+
+
+with gr.Blocks(theme=THEME, css=CSS, title="CS5788 — Image Editor 3-in-1") as app:
+
+    gr.HTML(
+        """
+        <div id="topbar">
+            <span class="wordmark">Three ways to rewrite a photograph.</span>
+            <span class="meta">CS 5788 / Cornell Tech / Spring 2026</span>
+        </div>
+        """
+    )
+
+    with gr.Tabs() as tabs:
+        # ---------------- Tab 1 ----------------
+        with gr.Tab("Replace Object", id=0):
+            gr.Markdown(
+                "**Swap one object in your photo for another.** "
+                "Describe what's there now and what you want instead. "
+                "The background stays bit-exact."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    r_in = gr.Image(type="pil", label="Source image", height=380)
+                    r_src = gr.Textbox(
+                        label="Source prompt — what's in the photo now",
+                        placeholder="a photograph of a cat sitting on a couch",
+                    )
+                    r_tgt = gr.Textbox(
+                        label="Target prompt — what should replace it",
+                        placeholder="a photograph of a dog sitting on a couch",
+                    )
+                    r_mask = gr.Radio(
+                        choices=["attention", "none"], value="attention",
+                        label="Background — preserve everything outside the object",
+                        info="'attention' keeps the background bit-exact. 'none' regenerates the whole image.",
+                    )
+                    with gr.Accordion("Advanced", open=False):
+                        r_sched = gr.Dropdown(
+                            choices=list(SCHEDULES.keys()),
+                            value="Linear decay (recommended)",
+                            label="Attention swap schedule",
+                        )
+                        r_comp = gr.Radio(
+                            choices=["strict", "inpaint"], value="strict",
+                            label="Composite mode (use 'inpaint' for size-mismatch edits)",
+                        )
+                        r_bg = gr.Textbox(
+                            label="Background prompt (only for inpaint mode; auto-derived if blank)",
+                            placeholder="optional",
+                        )
+                    r_btn = gr.Button("Replace object", variant="primary", size="lg")
+                with gr.Column(scale=1):
+                    r_out = gr.Image(type="pil", label="Edited image", height=380)
+                    r_status = gr.Textbox(label="Status", interactive=False)
+                    r_continue = gr.Button("Continue → Move Object", variant="secondary")
+            # Two-step click: 1) immediately mark Status "Running..." and disable
+            # the button, 2) actually run the model, 3) re-enable the button.
+            # Without step 1 the UI looks dead during the long wait and users mash
+            # the button, queueing 4+ runs.
+            def _starting(label="Running... (~30-90s)"):
+                return gr.update(value=label), gr.update(interactive=False)
+
+            def _re_enable():
+                return gr.update(interactive=True)
+
+            r_btn.click(_starting, None, [r_status, r_btn], queue=False).then(
+                run_replace,
+                [r_in, r_src, r_tgt, r_sched, r_mask, r_comp, r_bg],
+                [r_out, r_status],
+            ).then(_re_enable, None, [r_btn], queue=False)
+
+        # ---------------- Tab 2 ----------------
+        with gr.Tab("Move Object", id=1):
+            gr.Markdown(
+                "**Move an object within the same photo.** "
+                "Paint over the object on the left (where it is now), "
+                "paint where you want it on the right, then describe the final scene."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    m_in = gr.Image(type="pil", label="Source image", height=300)
+                    with gr.Row():
+                        m_src_mask = gr.ImageEditor(
+                            label="Source mask (paint over the object)",
+                            type="pil",
+                            height=280,
+                            brush=gr.Brush(default_size=30, colors=["#22c55e"]),
+                        )
+                        m_tgt_mask = gr.ImageEditor(
+                            label="Target mask (paint where to move it)",
+                            type="pil",
+                            height=280,
+                            brush=gr.Brush(default_size=30, colors=["#ef4444"]),
+                        )
+                    m_prompt = gr.Textbox(
+                        label="Final-scene prompt",
+                        placeholder="a cat sitting on the rug in a sunlit room",
+                    )
+                    with gr.Accordion("Advanced", open=False):
+                        m_noise_shift = gr.Checkbox(
+                            value=True,
+                            label="Use noise-prior shift (the novel contribution; uncheck for SDEdit baseline)",
+                        )
+                        m_seed = gr.Number(value=42, label="Seed", precision=0)
+                        m_steps = gr.Slider(20, 80, value=50, step=1, label="Inference steps")
+                        m_strength = gr.Slider(0.3, 1.0, value=0.7, step=0.05, label="SDEdit strength")
+                        m_cfg = gr.Slider(1.0, 15.0, value=7.5, step=0.5, label="Guidance scale")
+                    m_btn = gr.Button("Move object", variant="primary", size="lg")
+                with gr.Column(scale=1):
+                    m_out = gr.Image(type="pil", label="Result", height=380)
+                    m_status = gr.Textbox(label="Status", interactive=False)
+                    m_continue = gr.Button("Continue → Apply Style", variant="secondary")
+            m_in.change(_seed_editors, [m_in], [m_src_mask, m_tgt_mask])
+            m_btn.click(
+                lambda: (gr.update(value="Running... (~60-120s on first click; SD 2.1 + inpainting)"),
+                         gr.update(interactive=False)),
+                None, [m_status, m_btn], queue=False,
+            ).then(
+                run_relocate,
+                [m_in, m_src_mask, m_tgt_mask, m_prompt, m_noise_shift,
+                 m_seed, m_steps, m_strength, m_cfg],
+                [m_out, m_status],
+            ).then(_re_enable, None, [m_btn], queue=False)
+
+        # ---------------- Tab 3 ----------------
+        with gr.Tab("Apply Style", id=2):
+            gr.Markdown(
+                "**Repaint your photo in the style of one or more famous artists.** "
+                "Mix up to three styles with custom weights. Higher strength = stronger stylization."
+            )
+            style_choices = _style_choices()
+            with gr.Row():
+                with gr.Column(scale=1):
+                    s_in = gr.Image(type="pil", label="Source image", height=380)
+                    with gr.Row():
+                        s_style1 = gr.Dropdown(style_choices, value=style_choices[1] if len(style_choices) > 1 else NONE_LABEL, label="Style 1")
+                        s_w1 = gr.Slider(0, 100, value=100, step=5, label="Weight 1 (%)")
+                    with gr.Row():
+                        s_style2 = gr.Dropdown(style_choices, value=NONE_LABEL, label="Style 2")
+                        s_w2 = gr.Slider(0, 100, value=0, step=5, label="Weight 2 (%)")
+                    with gr.Row():
+                        s_style3 = gr.Dropdown(style_choices, value=NONE_LABEL, label="Style 3")
+                        s_w3 = gr.Slider(0, 100, value=0, step=5, label="Weight 3 (%)")
+                    with gr.Accordion("Advanced", open=False):
+                        s_strength = gr.Slider(0.2, 1.0, value=0.65, step=0.05, label="Stylization strength (lower preserves subject; raise for more abstract)")
+                        s_steps = gr.Slider(15, 60, value=30, step=1, label="Inference steps")
+                        s_cfg = gr.Slider(1.0, 15.0, value=7.5, step=0.5, label="Guidance scale")
+                        s_seed = gr.Number(value=0, label="Seed", precision=0)
+                    s_btn = gr.Button("Apply style", variant="primary", size="lg")
+                with gr.Column(scale=1):
+                    s_out = gr.Image(type="pil", label="Stylized image", height=380)
+                    s_status = gr.Textbox(label="Status", interactive=False)
+            s_btn.click(
+                lambda: (gr.update(value="Running... (~15-30s)"),
+                         gr.update(interactive=False)),
+                None, [s_status, s_btn], queue=False,
+            ).then(
+                run_style,
+                [s_in, s_style1, s_w1, s_style2, s_w2, s_style3, s_w3,
+                 s_strength, s_steps, s_cfg, s_seed],
+                [s_out, s_status],
+            ).then(_re_enable, None, [s_btn], queue=False)
+
+        # ---------------- Cascading-demo handoffs ----------------
+        # Result of one tab feeds the input of the next, then auto-switches tabs.
+        # Story arc: photo -> (Replace) fox -> (Move) fox in new spot -> (Style) Van-Gogh fox.
+        def _handoff_to_move(replace_result):
+            if replace_result is None:
+                return gr.update(), gr.update(), gr.update(), gr.update()
+            blank = {"background": replace_result, "layers": [], "composite": replace_result}
+            return replace_result, blank, blank, gr.Tabs(selected=1)
+
+        def _handoff_to_style(move_result):
+            if move_result is None:
+                return gr.update(), gr.update()
+            return move_result, gr.Tabs(selected=2)
+
+        r_continue.click(_handoff_to_move, [r_out], [m_in, m_src_mask, m_tgt_mask, tabs])
+        m_continue.click(_handoff_to_style, [m_out], [s_in, tabs])
+
+    gr.HTML(
+        """
+        <div style="text-align:center; padding: 16px; color: #64748b; font-size: 13px;">
+            CS5788 Generative Models · Cornell Tech · Spring 2026<br>
+            Object replacement · DDPM-noise-shift relocation · LoRA-adapted style transfer
+        </div>
+        """
+    )
+
+
+if __name__ == "__main__":
+    app.launch(share=True)

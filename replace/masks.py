@@ -1,0 +1,139 @@
+"""Localization mask derived from cross-attention.
+
+We pull cross-attn maps at mid timesteps (t_frac in [0.3, 0.7]) over the
+16x16 and 32x32 UNet layers (which encode layout), sum attention across
+the source-token columns, average over heads, threshold at the 80th
+percentile, dilate, and softly blur. Returned mask is (1, 1, 64, 64) in
+[0, 1] and matches the latent spatial dimension.
+"""
+import math
+
+import torch
+import torch.nn.functional as F
+
+
+def derive_attention_mask(
+    captured_maps: dict[tuple[int, str], torch.Tensor],
+    source_token_indices: list[int],
+    timesteps_desc_list: list[int],
+    *,
+    mid_t_range: tuple[float, float] = (0.3, 0.7),
+    target_resolutions: tuple[int, ...] = (16, 32),
+    upsample_to: int = 64,
+    threshold_quantile: float = 0.8,
+    dilate_pixels: int = 2,
+    soft_blur_sigma: float = 0.5,
+    batch_size: int = 2,
+    use_sample_index: int = 1,
+) -> torch.Tensor:
+    """captured_maps: from a StoreController. Each value has shape (B*H, R*R, L).
+
+    `use_sample_index` picks which batch sample's heads to read (default 1 = the
+    conditional pass under CFG, which carries the meaningful attention pattern).
+    """
+    if not source_token_indices:
+        return torch.ones(1, 1, upsample_to, upsample_to)
+
+    step_idx_for_t = {t: i for i, t in enumerate(timesteps_desc_list)}
+    S = len(timesteps_desc_list)
+    i_min = int(mid_t_range[0] * S)
+    i_max = int(mid_t_range[1] * S)
+
+    accumulator = torch.zeros(upsample_to, upsample_to)
+    count = 0
+
+    for (t_int, _layer), attn in captured_maps.items():
+        i = step_idx_for_t.get(t_int)
+        if i is None or not (i_min <= i <= i_max):
+            continue
+
+        BH, HW, _L = attn.shape
+        R = int(math.isqrt(HW))
+        if R * R != HW or R not in target_resolutions:
+            continue
+
+        H_per_sample = BH // batch_size
+        sample_attn = attn[use_sample_index * H_per_sample : (use_sample_index + 1) * H_per_sample]
+        col = sample_attn[:, :, source_token_indices].sum(dim=-1).mean(dim=0)  # (HW,)
+        col_2d = col.reshape(R, R).float()
+
+        col_up = F.interpolate(
+            col_2d[None, None], size=(upsample_to, upsample_to),
+            mode="bilinear", align_corners=False,
+        )[0, 0]
+
+        accumulator += col_up
+        count += 1
+
+    if count == 0:
+        return torch.ones(1, 1, upsample_to, upsample_to)
+
+    avg = accumulator / count
+    threshold = torch.quantile(avg.flatten(), threshold_quantile)
+    binary = (avg >= threshold).float()
+    if dilate_pixels > 0:
+        binary = _dilate(binary, dilate_pixels)
+    if soft_blur_sigma > 0:
+        binary = _gaussian_blur(binary, soft_blur_sigma)
+    return binary[None, None]
+
+
+def derive_target_mask(
+    target_maps: dict[tuple[int, str], torch.Tensor],
+    replaced_token_indices: list[int],
+    timesteps_desc_list: list[int],
+    *,
+    mid_t_range: tuple[float, float] = (0.3, 0.7),
+    target_resolutions: tuple[int, ...] = (16, 32),
+    upsample_to: int = 64,
+    threshold_quantile: float = 0.8,
+    dilate_pixels: int = 2,
+    soft_blur_sigma: float = 0.5,
+) -> torch.Tensor:
+    """Same recipe as derive_attention_mask but for target-side captured maps.
+
+    target_maps stores raw target-conditional attention (heads only, no batch
+    interleaving), so batch_size=1 / use_sample_index=0. Reads the columns at
+    `replaced_token_indices` -- positions where the target prompt has the new
+    word -- to find where the target object will render.
+    """
+    return derive_attention_mask(
+        captured_maps=target_maps,
+        source_token_indices=replaced_token_indices,
+        timesteps_desc_list=timesteps_desc_list,
+        mid_t_range=mid_t_range,
+        target_resolutions=target_resolutions,
+        upsample_to=upsample_to,
+        threshold_quantile=threshold_quantile,
+        dilate_pixels=dilate_pixels,
+        soft_blur_sigma=soft_blur_sigma,
+        batch_size=1,
+        use_sample_index=0,
+    )
+
+
+def _dilate(mask: torch.Tensor, pixels: int) -> torch.Tensor:
+    """Max-pool dilation. Input (H, W), output (H, W)."""
+    k = 2 * pixels + 1
+    return F.max_pool2d(mask[None, None], kernel_size=k, stride=1, padding=pixels)[0, 0]
+
+
+def _gaussian_blur(mask: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur. Input/output (H, W). Output is float in [0, 1]."""
+    k = int(2 * round(2 * sigma) + 1)
+    pad = k // 2
+    x = torch.arange(k, dtype=mask.dtype, device=mask.device) - pad
+    g = torch.exp(-(x ** 2) / (2 * sigma * sigma))
+    g = g / g.sum()
+    m = mask[None, None]
+    m = F.conv2d(m, g.view(1, 1, 1, k), padding=(0, pad))
+    m = F.conv2d(m, g.view(1, 1, k, 1), padding=(pad, 0))
+    return m[0, 0]
+
+
+def visualize_mask(mask: torch.Tensor, size: int = 512) -> torch.Tensor:
+    """Upsample mask to viewable size for a quick PIL save. Returns (H, W) in [0, 1]."""
+    m = mask
+    if m.ndim == 4:
+        m = m[0, 0]
+    return F.interpolate(m[None, None].float(), size=(size, size), mode="bilinear", align_corners=False)[0, 0]
